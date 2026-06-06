@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from contextlib import nullcontext
 
 import torch
 from torch.utils.data import DataLoader
@@ -93,21 +94,26 @@ class Collate:
                 "t_ids": t["input_ids"], "t_mask": t["attention_mask"]}
 
 
-def step(model, batch, opt, device, dtype, vis_feats=None):
-    with torch.autocast(device_type=device.type, dtype=dtype):
-        out = model(
-            None if vis_feats is not None else batch["frames"].to(device, non_blocking=True),
-            batch["q_ids"].to(device), batch["q_mask"].to(device),
-            batch["t_ids"].to(device), batch["t_mask"].to(device),
-            vis_feats=vis_feats,
-        )
+def _ctx(device, use_autocast):
+    """Autocast for AMP (fp32 master); no-op for pure-bf16 (model already bf16)."""
+    return (torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+            if use_autocast else nullcontext())
+
+
+def step(model, batch, opt, device, mdtype, use_autocast, vis_feats=None):
+    with _ctx(device, use_autocast):
+        frames = (None if vis_feats is not None
+                  else batch["frames"].to(device, non_blocking=True).to(mdtype))
+        vf = vis_feats.to(mdtype) if vis_feats is not None else None
+        out = model(frames, batch["q_ids"].to(device), batch["q_mask"].to(device),
+                    batch["t_ids"].to(device), batch["t_mask"].to(device), vis_feats=vf)
         loss = bidirectional_infonce(out["pred"], out["target"], 0.07)
     loss.backward()
     opt.step()
     opt.zero_grad(set_to_none=True)
 
 
-def run_live(name, model, loader, device, dtype, steps, warmup):
+def run_live(name, model, loader, device, mdtype, use_autocast, steps, warmup):
     model.train()
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
     it = iter(loader)
@@ -120,12 +126,12 @@ def run_live(name, model, loader, device, dtype, steps, warmup):
             return next(it), it
 
     for _ in range(warmup):
-        b, it = nxt(it); step(model, b, opt, device, dtype)
+        b, it = nxt(it); step(model, b, opt, device, mdtype, use_autocast)
     if device.type == "cuda":
         torch.cuda.synchronize()
     t0 = time.perf_counter(); imgs = 0
     for _ in range(steps):
-        b, it = nxt(it); step(model, b, opt, device, dtype); imgs += b["frames"].shape[0]
+        b, it = nxt(it); step(model, b, opt, device, mdtype, use_autocast); imgs += b["frames"].shape[0]
     if device.type == "cuda":
         torch.cuda.synchronize()
     dt = time.perf_counter() - t0
@@ -133,7 +139,7 @@ def run_live(name, model, loader, device, dtype, steps, warmup):
     return imgs / dt
 
 
-def run_cached(name, model, feats, toks, device, dtype, steps, warmup, batch):
+def run_cached(name, model, feats, toks, device, mdtype, use_autocast, steps, warmup, batch):
     model.train()
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
     n = feats.shape[0]
@@ -142,15 +148,15 @@ def run_cached(name, model, feats, toks, device, dtype, steps, warmup, batch):
         idx = torch.randint(0, n, (batch,))
         b = {"q_ids": toks["q_ids"][idx], "q_mask": toks["q_mask"][idx],
              "t_ids": toks["t_ids"][idx], "t_mask": toks["t_mask"][idx]}
-        return b, feats[idx].to(device, non_blocking=True).float()
+        return b, feats[idx].to(device, non_blocking=True)
 
     for _ in range(warmup):
-        b, vf = sample(); step(model, b, opt, device, dtype, vis_feats=vf)
+        b, vf = sample(); step(model, b, opt, device, mdtype, use_autocast, vis_feats=vf)
     if device.type == "cuda":
         torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(steps):
-        b, vf = sample(); step(model, b, opt, device, dtype, vis_feats=vf)
+        b, vf = sample(); step(model, b, opt, device, mdtype, use_autocast, vis_feats=vf)
     if device.type == "cuda":
         torch.cuda.synchronize()
     dt = time.perf_counter() - t0
@@ -159,15 +165,15 @@ def run_cached(name, model, feats, toks, device, dtype, steps, warmup, batch):
     return imgs / dt
 
 
-def precompute(model, ds, collate, device, dtype, batch, workers):
+def precompute(model, ds, collate, device, mdtype, use_autocast, batch, workers):
     loader = DataLoader(ds, batch_size=batch, shuffle=False, num_workers=workers,
                         pin_memory=True, collate_fn=collate, drop_last=False)
     feats, qi, qm, ti, tm = [], [], [], [], []
     model.eval()
     with torch.no_grad():
         for b in tqdm(loader, desc="precompute", leave=False):
-            fr = b["frames"].to(device, non_blocking=True)
-            with torch.autocast(device_type=device.type, dtype=dtype):
+            fr = b["frames"].to(device, non_blocking=True).to(mdtype)
+            with _ctx(device, use_autocast):
                 feats.append(model.visual_features(fr).half().cpu())
             qi.append(b["q_ids"]); qm.append(b["q_mask"]); ti.append(b["t_ids"]); tm.append(b["t_mask"])
     model.train()
@@ -191,6 +197,9 @@ def main():
                     help="frames/sample for vjepa2 (even; 2=image-dup, 8=video setting)")
     ap.add_argument("--y-encoder", choices=["standin", "embeddinggemma"], default="standin",
                     help="target encoder: stand-in, or real google/embeddinggemma-300m")
+    ap.add_argument("--precision", choices=["amp", "bf16"], default="amp",
+                    help="amp = fp32 master + autocast bf16 (default); "
+                         "bf16 = pure bf16 weights + bf16 Adam (half the optimizer memory)")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -201,11 +210,16 @@ def main():
     else:
         t_tok = q_tok
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16
+    # Autocast stays on in both modes (it reconciles mixed dtypes from the HF
+    # backbones). bf16 saves memory via bf16 *weights + optimizer states*, not
+    # by toggling autocast.
+    use_autocast = True
+    mdtype = torch.bfloat16 if args.precision == "bf16" else torch.float32
     collate = Collate(q_tok, t_tok, max_q=32, max_t=48)
 
     print(f"from-scratch VL-JEPA  predictor={args.predictor}  attn={args.attn}  "
-          f"y_encoder={args.y_encoder}  device={device}  batch={args.batch}  steps={args.steps}")
+          f"y_encoder={args.y_encoder}  precision={args.precision}  device={device}  "
+          f"batch={args.batch}  steps={args.steps}")
 
     results = {}
     for vision in [v.strip() for v in args.vision.split(",") if v.strip()]:
@@ -221,16 +235,18 @@ def main():
             model.x_encoder = HFXEncoder(cfg).to(device)  # real V-JEPA 2 ViT-L (frozen)
         if args.y_encoder == "embeddinggemma":
             model.y_encoder = HFYEncoder(cfg).to(device)  # real EmbeddingGemma (trains @0.05x)
+        if args.precision == "bf16":
+            model = model.to(torch.bfloat16)  # pure bf16 weights + bf16 Adam states
 
         loader = DataLoader(ds, batch_size=args.batch, shuffle=True, num_workers=args.workers,
                             pin_memory=True, collate_fn=collate, drop_last=True,
                             persistent_workers=(args.workers > 0),
                             prefetch_factor=(4 if args.workers > 0 else None))
-        live = run_live(f"{vision} LIVE (X-Enc each step)", model, loader, device, dtype,
-                        args.steps, args.warmup)
-        feats, toks = precompute(model, ds, collate, device, dtype, args.batch, args.workers)
-        cached = run_cached(f"{vision} CACHED (frozen feats)", model, feats, toks, device, dtype,
-                            args.steps, args.warmup, args.batch)
+        live = run_live(f"{vision} LIVE (X-Enc each step)", model, loader, device, mdtype,
+                        use_autocast, args.steps, args.warmup)
+        feats, toks = precompute(model, ds, collate, device, mdtype, use_autocast, args.batch, args.workers)
+        cached = run_cached(f"{vision} CACHED (frozen feats)", model, feats, toks, device, mdtype,
+                            use_autocast, args.steps, args.warmup, args.batch)
         results[vision] = (live, cached)
         del model, loader, ds, feats, toks
         if device.type == "cuda":

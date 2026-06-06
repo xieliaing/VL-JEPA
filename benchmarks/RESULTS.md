@@ -103,6 +103,33 @@ The cache speedup also drops to ~1.06×: EmbeddingGemma's per-step forward+backw
 enlarges the step, so removing only the V-JEPA 2 forward saves proportionally
 less (cache speedup ≈ X-Enc cost ÷ total step cost).
 
+### Pure bf16 unlocks the authentic paper config on 16 GB
+
+The runs above use **AMP** (fp32 master weights + autocast bf16); the fp32 Adam
+states are what overflow 16 GB. Switching to **pure bf16** (`--precision bf16`:
+bf16 weights + bf16 Adam) halves that fixed footprint (~15 GB → ~7.8 GB) and makes
+the **fully-authentic paper config** — real V-JEPA 2 + real EmbeddingGemma +
+paper predictor (2048/8) + SDPA — fit and scale:
+
+| batch | AMP (fp32 master) | bf16 live (img/s) | bf16 cached (img/s) |
+|-------|------------------:|------------------:|--------------------:|
+| 1  | 0.3 (spill) | —    | —    |
+| 2  | 0.5 (spill) | 6.4  | 5.3  |
+| 4  | —           | 10.4 | 10.1 |
+| 8  | —           | 16.2 | 17.3 |
+| **16** | —       | **21.7** | **26.0** |
+| 32 | —           | 1.5 (spill) | 2.5 |
+
+Reproduce: `python scripts/benchmark.py --predictor paper --vision vjepa2 --y-encoder embeddinggemma --precision bf16 --frames 2 --batch 16`
+
+**Takeaways:** pure bf16 takes the authentic paper config from *won't run* (0.5
+img/s, spilling at batch 2 under AMP) to **~26 img/s cached at batch 16** — fitting
+*and* scaling on the 16 GB GPU; the new VRAM ceiling is batch 16 (batch 32 spills).
+Caveat: bf16 master + bf16 Adam is less numerically stable than fp32-master AMP
+for long training (bf16's 8-bit mantissa degrades Adam's second-moment estimate).
+For real training, fp32 master + 8-bit Adam (bitsandbytes) trades a little memory
+for better stability; pure bf16 is ideal for throughput/feasibility.
+
 ## Correctness
 
 SDPA is numerically equivalent to eager (max output diff **3.6e-7**); see

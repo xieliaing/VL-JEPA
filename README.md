@@ -120,7 +120,11 @@ PYTHONPATH=. python scripts/benchmark.py --vision vjepa2 --y-encoder embeddingge
     --predictor proxy --frames 2 --batch 4
 ```
 
-See `benchmarks/RESULTS.md` for measured authentic-backbone throughput on 16 GB.
+Use `--precision bf16` (pure bf16 weights + bf16 Adam, vs the default AMP's fp32
+master) to roughly halve optimizer memory — this makes the **full paper-size
+predictor + both real encoders** fit and scale on a 16 GB GPU (~26 img/s cached
+at batch 16). See `benchmarks/RESULTS.md` for the measured authentic-backbone
+throughput and the AMP-vs-bf16 comparison.
 
 ## Tests
 
