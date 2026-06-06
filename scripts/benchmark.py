@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from vljepa.data import VisionLanguageJsonlDataset
-from vljepa.model import VLJEPA, VLJEPAConfig, bidirectional_infonce
+from vljepa.model import HFXEncoder, VLJEPA, VLJEPAConfig, bidirectional_infonce
 
 
 class ViTBXEncoder(torch.nn.Module):
@@ -50,8 +50,8 @@ class ViTBXEncoder(torch.nn.Module):
         return x[:, 1:, :].reshape(b, -1, self.out_dim)  # drop CLS -> [B,196,768]
 
 
-def make_config(predictor: str, attn_impl: str) -> VLJEPAConfig:
-    common = dict(vocab_size=50257, vis_dim=768, num_visual_tokens=196,
+def make_config(predictor: str, attn_impl: str, vis_dim: int, num_visual_tokens: int) -> VLJEPAConfig:
+    common = dict(vocab_size=50257, vis_dim=vis_dim, num_visual_tokens=num_visual_tokens,
                   max_query_tokens=32, y_hidden=768, y_layers=2, shared_dim=1536,
                   attn_impl=attn_impl)
     if predictor == "proxy":
@@ -61,6 +61,18 @@ def make_config(predictor: str, attn_impl: str) -> VLJEPAConfig:
         return VLJEPAConfig(pred_hidden=2048, pred_layers=8, pred_heads=32,
                             pred_kv_heads=8, pred_intermediate=8192, **common)
     raise ValueError(predictor)
+
+
+def vision_spec(vision: str, frames: int):
+    """Return (vis_dim, num_visual_tokens, num_frames, image_size) per encoder."""
+    if vision in ("conv", "vit_b_16"):
+        return 768, 196, 1, 224
+    if vision == "vjepa2":
+        # Real V-JEPA 2 ViT-L: hidden 1024, tokens = (frames/2) * (256/16)^2.
+        if frames % 2 != 0:
+            raise ValueError("V-JEPA 2 needs an even frame count (tubelet size 2).")
+        return 1024, (frames // 2) * 256, frames, 256
+    raise ValueError(vision)
 
 
 class Collate:
@@ -168,10 +180,12 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--steps", type=int, default=120)
     ap.add_argument("--warmup", type=int, default=15)
-    ap.add_argument("--image-size", type=int, default=224)
     ap.add_argument("--predictor", choices=["proxy", "paper"], default="proxy")
     ap.add_argument("--attn", choices=["eager", "sdpa"], default="sdpa")
-    ap.add_argument("--vision", default="conv,vit_b_16", help="comma list: conv, vit_b_16")
+    ap.add_argument("--vision", default="conv,vit_b_16",
+                    help="comma list: conv, vit_b_16, vjepa2 (real V-JEPA 2 ViT-L)")
+    ap.add_argument("--frames", type=int, default=2,
+                    help="frames/sample for vjepa2 (even; 2=image-dup, 8=video setting)")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -179,20 +193,23 @@ def main():
     tok.pad_token = tok.eos_token
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
-    ds = VisionLanguageJsonlDataset(args.manifest, num_frames=1, image_size=args.image_size)
     collate = Collate(tok, max_q=32, max_t=48)
 
     print(f"from-scratch VL-JEPA  predictor={args.predictor}  attn={args.attn}  device={device}  "
-          f"batch={args.batch}  steps={args.steps}  dataset={len(ds)} imgs")
+          f"batch={args.batch}  steps={args.steps}")
 
     results = {}
     for vision in [v.strip() for v in args.vision.split(",") if v.strip()]:
+        vis_dim, n_tok, n_frames, img_size = vision_spec(vision, args.frames)
+        ds = VisionLanguageJsonlDataset(args.manifest, num_frames=n_frames, image_size=img_size)
         print("=" * 70)
-        print(f"VISION = {vision}")
-        cfg = make_config(args.predictor, args.attn)
+        print(f"VISION = {vision}  (frames={n_frames}, {img_size}px, vis_tokens={n_tok}, vis_dim={vis_dim})")
+        cfg = make_config(args.predictor, args.attn, vis_dim, n_tok)
         model = VLJEPA(cfg).to(device)
         if vision == "vit_b_16":
             model.x_encoder = ViTBXEncoder().to(device)
+        elif vision == "vjepa2":
+            model.x_encoder = HFXEncoder(cfg).to(device)  # real V-JEPA 2 ViT-L (frozen)
 
         loader = DataLoader(ds, batch_size=args.batch, shuffle=True, num_workers=args.workers,
                             pin_memory=True, collate_fn=collate, drop_last=True,
@@ -204,7 +221,7 @@ def main():
         cached = run_cached(f"{vision} CACHED (frozen feats)", model, feats, toks, device, dtype,
                             args.steps, args.warmup, args.batch)
         results[vision] = (live, cached)
-        del model, loader, feats, toks
+        del model, loader, ds, feats, toks
         if device.type == "cuda":
             torch.cuda.empty_cache()
 

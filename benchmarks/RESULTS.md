@@ -48,6 +48,30 @@ spills for both. Eager can't exploit batch 8 (its materialized score tensors hit
 memory pressure, capping it at ~19), which is exactly where SDPA wins. The
 paper-scale 490M predictor still needs datacenter GPUs to train at full speed.
 
+## Authentic V-JEPA 2 X-Encoder (real `facebook/vjepa2-vitl-fpc64-256`)
+
+The X-Encoder above is a lightweight stand-in (`vit_b_16`). This section uses the
+**real frozen V-JEPA 2 ViT-L** (326M, hidden 1024) as in the paper, with the
+from-scratch paper predictor (8-layer/2048) + SDPA. Images are duplicated to
+**2 frames @ 256²** (tubelet 2 → **256 visual tokens**), matching the paper's
+image stage. It runs on the 16 GB RTX 4090 Laptop at small batch.
+
+| batch | live (img/s) | cached (img/s) | cache speedup |
+|-------|-------------:|---------------:|--------------:|
+| **4** | 12.3 | **17.5** | **1.42×** |
+| 8     | 8.8  | 11.5 | 1.32× |
+
+Reproduce: `python scripts/benchmark.py --predictor paper --attn sdpa --vision vjepa2 --frames 2 --batch 4`
+
+**Takeaways:** With the real, heavy V-JEPA 2 encoder the **frozen-feature cache
+now gives a clear speedup (1.42×)** — versus ~1.0× under the lightweight
+`vit_b_16` stand-in — confirming that the cache benefit scales with X-Encoder
+cost. Batch 4 is the sweet spot; at batch 8 the resident 326M V-JEPA 2 weights
+plus the paper predictor exceed 16 GB and spill (cached 17.5 → 11.5). This is the
+most paper-authentic configuration runnable on a 16 GB GPU (real V-JEPA 2 vision
++ paper-size Llama-3 predictor architecture); only the Llama/EmbeddingGemma
+*weights* are stand-ins, swappable via the `hf` backend.
+
 ## Correctness
 
 SDPA is numerically equivalent to eager (max output diff **3.6e-7**); see
