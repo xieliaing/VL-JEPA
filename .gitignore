@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Downloaded benchmark data & feature caches (regenerate via scripts/)
+/data/
+/benchmarks/cache/
+
+# Training/run artifacts (checkpoints, logs)
+/outputs/
+
+# Model / HuggingFace caches
+.cache/
+
+# Local notes / scratch
+paper_text.txt

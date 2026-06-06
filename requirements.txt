@@ -1,0 +1,8 @@
+torch>=2.2.0
+torchvision>=0.17.0
+transformers>=4.52.0   # >=4.52 ships VJEPA2Model (real HF backend)
+Pillow>=10.0.0
+tqdm>=4.66.0
+pytest>=8.0.0
+datasets>=2.0.0        # only for scripts/download_smoke_data.py
+av>=12.0.0             # optional: video manifests in vljepa/data.py
