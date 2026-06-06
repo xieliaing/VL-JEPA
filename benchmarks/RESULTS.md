@@ -40,13 +40,15 @@ this on 192× H200, 141 GB each.)
 | 16 | eager | 2.2 | 8.6 | VRAM overflow → shared-memory spill |
 | 16 | sdpa  | 9.4 | 8.8 | also spills at paper scale on 16 GB |
 
-**Takeaways:** SDPA delivers a clean +20% where attention is on the critical path
-(proxy config), and its memory efficiency raises the batch ceiling before VRAM
-spill. For the paper predictor on 16 GB, **batch 8 + SDPA is optimal (~30 img/s,
-1.53× over eager)**: batch 4 underutilizes the GPU (eager ≈ SDPA ≈ 17), batch 16
-spills for both. Eager can't exploit batch 8 (its materialized score tensors hit
-memory pressure, capping it at ~19), which is exactly where SDPA wins. The
-paper-scale 490M predictor still needs datacenter GPUs to train at full speed.
+Takeaways. SDPA increases cached throughput by approximately 20% in the proxy
+configuration, where attention accounts for a significant fraction of each step.
+For the paper predictor on 16 GB, the highest throughput is at batch 8 with SDPA
+(30.4 img/s live, 29.6 cached), which is 1.53 times the eager rate. At batch 4 the
+GPU is underutilized and the two attention implementations are comparable
+(approximately 17 img/s). At batch 16 both implementations exceed VRAM and spill
+to shared system memory. Eager attention at batch 8 is limited to approximately
+19 img/s because its materialized score tensors increase memory pressure. The
+490M paper predictor requires datacenter-class GPUs for full-speed training.
 
 ## Authentic V-JEPA 2 X-Encoder (real `facebook/vjepa2-vitl-fpc64-256`)
 
@@ -63,14 +65,15 @@ image stage. It runs on the 16 GB RTX 4090 Laptop at small batch.
 
 Reproduce: `python scripts/benchmark.py --predictor paper --attn sdpa --vision vjepa2 --frames 2 --batch 4`
 
-**Takeaways:** With the real, heavy V-JEPA 2 encoder the **frozen-feature cache
-now gives a clear speedup (1.42×)** — versus ~1.0× under the lightweight
-`vit_b_16` stand-in — confirming that the cache benefit scales with X-Encoder
-cost. Batch 4 is the sweet spot; at batch 8 the resident 326M V-JEPA 2 weights
-plus the paper predictor exceed 16 GB and spill (cached 17.5 → 11.5). This is the
-most paper-authentic configuration runnable on a 16 GB GPU (real V-JEPA 2 vision
-+ paper-size Llama-3 predictor architecture); only the Llama/EmbeddingGemma
-*weights* are stand-ins, swappable via the `hf` backend.
+Takeaways. With the real V-JEPA 2 encoder the frozen-feature cache provides a
+1.42× speedup at batch 4, compared with approximately 1.0× under the lightweight
+`vit_b_16` stand-in; the cache benefit is proportional to X-Encoder cost.
+Throughput is highest at batch 4. At batch 8 the resident 326M V-JEPA 2 weights
+together with the paper predictor exceed 16 GB and cached throughput falls from
+17.5 to 11.5 img/s. This is the most paper-authentic configuration that runs on a
+16 GB GPU, combining the real V-JEPA 2 vision encoder with the paper-size Llama-3
+predictor architecture; only the Llama and EmbeddingGemma weights are stand-ins,
+replaceable via the `hf` backend.
 
 ### + real EmbeddingGemma Y-Encoder (`google/embeddinggemma-300m`)
 
@@ -85,23 +88,22 @@ from-scratch weights. Reproduce:
 | paper (2048/8) | 2 | 0.5  | 0.6  | severe VRAM spill — does not fit |
 | paper (2048/8) | 1 | 0.3  | 0.2  | *worse* than b=2 — overflow is optimizer-state, not activations |
 
-**Takeaways:** real V-JEPA 2 + real EmbeddingGemma + the proxy predictor is the
-**maximal authentic config runnable on a 16 GB GPU** (~15 img/s @ batch 4); only
-the Llama-3 predictor *weights* remain from-scratch (gated).
-
-The paper-size predictor with **both** 300M+ real encoders **cannot be made to
-fit by shrinking the batch.** The binding constraint is **batch-independent
-optimizer-state memory**: V-JEPA 2 (~1.3 GB frozen) + ~893M trainable params ×
-16 B (fp32 param+grad+Adam m+v) ≈ **15 GB** before any activations. So it spills
-to shared system memory at any batch — and batch 1 (0.3 img/s) is *slower* than
-batch 2 (0.5), because there is no batch parallelism to amortize the constant
-spill over. This configuration needs a larger GPU, or memory-reduction
-techniques (pure-bf16 master weights, 8-bit Adam, LoRA on the predictor/Y-Encoder,
-or freezing the query embedding) to shrink the fixed optimizer footprint.
-
-The cache speedup also drops to ~1.06×: EmbeddingGemma's per-step forward+backward
-enlarges the step, so removing only the V-JEPA 2 forward saves proportionally
-less (cache speedup ≈ X-Enc cost ÷ total step cost).
+Takeaways. The combination of real V-JEPA 2, real EmbeddingGemma, and the proxy
+predictor runs on a 16 GB GPU at approximately 15 img/s at batch 4; only the
+Llama-3 predictor weights remain from-scratch. The paper-size predictor with both
+300M-parameter real encoders does not fit within 16 GB, and reducing the batch
+size does not resolve this. The binding constraint is batch-independent
+optimizer-state memory: the frozen V-JEPA 2 (approximately 1.3 GB) plus
+approximately 893M trainable parameters at 16 bytes each (fp32 parameter,
+gradient, and two Adam moments) total about 15 GB before activations. The
+configuration spills to shared system memory at any batch size, and batch 1
+(0.3 img/s) is slower than batch 2 (0.5 img/s) because there is no batch
+parallelism to amortize the spill. Reducing this footprint requires pure-bf16
+weights, 8-bit Adam, LoRA on the predictor or Y-Encoder, or freezing the query
+embedding. The cache speedup in this configuration is approximately 1.06×,
+because EmbeddingGemma's per-step forward and backward increase total step cost
+while the cache removes only the V-JEPA 2 forward (cache speedup is approximately
+X-Encoder cost divided by total step cost).
 
 ### Pure bf16 unlocks the authentic paper config on 16 GB
 
@@ -122,13 +124,16 @@ paper predictor (2048/8) + SDPA — fit and scale:
 
 Reproduce: `python scripts/benchmark.py --predictor paper --vision vjepa2 --y-encoder embeddinggemma --precision bf16 --frames 2 --batch 16`
 
-**Takeaways:** pure bf16 takes the authentic paper config from *won't run* (0.5
-img/s, spilling at batch 2 under AMP) to **~26 img/s cached at batch 16** — fitting
-*and* scaling on the 16 GB GPU; the new VRAM ceiling is batch 16 (batch 32 spills).
-Caveat: bf16 master + bf16 Adam is less numerically stable than fp32-master AMP
-for long training (bf16's 8-bit mantissa degrades Adam's second-moment estimate).
-For real training, fp32 master + 8-bit Adam (bitsandbytes) trades a little memory
-for better stability; pure bf16 is ideal for throughput/feasibility.
+Takeaways. Pure bf16 reduces the fixed memory footprint sufficiently for the
+authentic paper configuration to fit on the 16 GB GPU. Throughput increases with
+batch size, from 6.4 img/s at batch 2 to 21.7 img/s live and 26.0 img/s cached at
+batch 16; batch 32 exceeds VRAM and spills. Under fp32-master AMP the same
+configuration does not fit and runs at 0.3 to 0.5 img/s. bf16 master weights with
+bf16 Adam are less numerically stable than fp32-master AMP for extended training,
+because bf16's 8-bit mantissa reduces the precision of Adam's second-moment
+estimate. fp32 master weights with 8-bit Adam provide a more stable alternative
+at a higher memory cost; pure bf16 is appropriate for throughput and feasibility
+measurement.
 
 ## Correctness
 
