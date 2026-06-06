@@ -83,15 +83,25 @@ from-scratch weights. Reproduce:
 |-----------|-------|-------------:|---------------:|------|
 | proxy (768/4)  | 4 | 14.7 | 15.6 | runs cleanly on 16 GB |
 | paper (2048/8) | 2 | 0.5  | 0.6  | severe VRAM spill — does not fit |
+| paper (2048/8) | 1 | 0.3  | 0.2  | *worse* than b=2 — overflow is optimizer-state, not activations |
 
 **Takeaways:** real V-JEPA 2 + real EmbeddingGemma + the proxy predictor is the
 **maximal authentic config runnable on a 16 GB GPU** (~15 img/s @ batch 4); only
-the Llama-3 predictor *weights* remain from-scratch (gated). The paper-size
-predictor together with **both** 300M+ real encoders and their optimizer states
-far exceeds 16 GB and spills to shared memory (0.5 img/s) — that combination
-needs a larger GPU. The cache speedup also drops to ~1.06×: EmbeddingGemma's
-per-step forward+backward enlarges the step, so removing only the V-JEPA 2
-forward saves proportionally less (cache speedup ≈ X-Enc cost ÷ total step cost).
+the Llama-3 predictor *weights* remain from-scratch (gated).
+
+The paper-size predictor with **both** 300M+ real encoders **cannot be made to
+fit by shrinking the batch.** The binding constraint is **batch-independent
+optimizer-state memory**: V-JEPA 2 (~1.3 GB frozen) + ~893M trainable params ×
+16 B (fp32 param+grad+Adam m+v) ≈ **15 GB** before any activations. So it spills
+to shared system memory at any batch — and batch 1 (0.3 img/s) is *slower* than
+batch 2 (0.5), because there is no batch parallelism to amortize the constant
+spill over. This configuration needs a larger GPU, or memory-reduction
+techniques (pure-bf16 master weights, 8-bit Adam, LoRA on the predictor/Y-Encoder,
+or freezing the query embedding) to shrink the fixed optimizer footprint.
+
+The cache speedup also drops to ~1.06×: EmbeddingGemma's per-step forward+backward
+enlarges the step, so removing only the V-JEPA 2 forward saves proportionally
+less (cache speedup ≈ X-Enc cost ÷ total step cost).
 
 ## Correctness
 
