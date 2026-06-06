@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from vljepa.data import VisionLanguageJsonlDataset
-from vljepa.model import HFXEncoder, VLJEPA, VLJEPAConfig, bidirectional_infonce
+from vljepa.model import HFXEncoder, HFYEncoder, VLJEPA, VLJEPAConfig, bidirectional_infonce
 
 
 class ViTBXEncoder(torch.nn.Module):
@@ -76,15 +76,18 @@ def vision_spec(vision: str, frames: int):
 
 
 class Collate:
-    def __init__(self, tok, max_q=32, max_t=48):
-        self.tok, self.max_q, self.max_t = tok, max_q, max_t
+    """Tokenizes query and target separately (they may use different tokenizers:
+    gpt2 for the from-scratch query embedding, Gemma for real EmbeddingGemma)."""
+
+    def __init__(self, q_tok, t_tok, max_q=32, max_t=48):
+        self.q_tok, self.t_tok, self.max_q, self.max_t = q_tok, t_tok, max_q, max_t
 
     def __call__(self, batch):
         frames = torch.stack([b["frames"] for b in batch], 0)
-        q = self.tok([b["query"] for b in batch], max_length=self.max_q, padding="max_length",
-                     truncation=True, return_tensors="pt")
-        t = self.tok([b["target"] for b in batch], max_length=self.max_t, padding="max_length",
-                     truncation=True, return_tensors="pt")
+        q = self.q_tok([b["query"] for b in batch], max_length=self.max_q, padding="max_length",
+                       truncation=True, return_tensors="pt")
+        t = self.t_tok([b["target"] for b in batch], max_length=self.max_t, padding="max_length",
+                       truncation=True, return_tensors="pt")
         return {"frames": frames,
                 "q_ids": q["input_ids"], "q_mask": q["attention_mask"],
                 "t_ids": t["input_ids"], "t_mask": t["attention_mask"]}
@@ -186,17 +189,23 @@ def main():
                     help="comma list: conv, vit_b_16, vjepa2 (real V-JEPA 2 ViT-L)")
     ap.add_argument("--frames", type=int, default=2,
                     help="frames/sample for vjepa2 (even; 2=image-dup, 8=video setting)")
+    ap.add_argument("--y-encoder", choices=["standin", "embeddinggemma"], default="standin",
+                    help="target encoder: stand-in, or real google/embeddinggemma-300m")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("gpt2")
-    tok.pad_token = tok.eos_token
+    q_tok = AutoTokenizer.from_pretrained("gpt2")  # query -> from-scratch predictor embed
+    q_tok.pad_token = q_tok.eos_token
+    if args.y_encoder == "embeddinggemma":
+        t_tok = AutoTokenizer.from_pretrained("google/embeddinggemma-300m")  # target -> real Gemma
+    else:
+        t_tok = q_tok
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
-    collate = Collate(tok, max_q=32, max_t=48)
+    collate = Collate(q_tok, t_tok, max_q=32, max_t=48)
 
-    print(f"from-scratch VL-JEPA  predictor={args.predictor}  attn={args.attn}  device={device}  "
-          f"batch={args.batch}  steps={args.steps}")
+    print(f"from-scratch VL-JEPA  predictor={args.predictor}  attn={args.attn}  "
+          f"y_encoder={args.y_encoder}  device={device}  batch={args.batch}  steps={args.steps}")
 
     results = {}
     for vision in [v.strip() for v in args.vision.split(",") if v.strip()]:
@@ -210,6 +219,8 @@ def main():
             model.x_encoder = ViTBXEncoder().to(device)
         elif vision == "vjepa2":
             model.x_encoder = HFXEncoder(cfg).to(device)  # real V-JEPA 2 ViT-L (frozen)
+        if args.y_encoder == "embeddinggemma":
+            model.y_encoder = HFYEncoder(cfg).to(device)  # real EmbeddingGemma (trains @0.05x)
 
         loader = DataLoader(ds, batch_size=args.batch, shuffle=True, num_workers=args.workers,
                             pin_memory=True, collate_fn=collate, drop_last=True,

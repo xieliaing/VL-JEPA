@@ -72,6 +72,27 @@ most paper-authentic configuration runnable on a 16 GB GPU (real V-JEPA 2 vision
 + paper-size Llama-3 predictor architecture); only the Llama/EmbeddingGemma
 *weights* are stand-ins, swappable via the `hf` backend.
 
+### + real EmbeddingGemma Y-Encoder (`google/embeddinggemma-300m`)
+
+Both encoders now real: V-JEPA 2 ViT-L X-Encoder **and** EmbeddingGemma-300M
+(302.9M, trained @0.05×) as the Y-Encoder. Only the Llama-3 predictor uses
+from-scratch weights. Reproduce:
+`python scripts/benchmark.py --vision vjepa2 --y-encoder embeddinggemma --predictor proxy --frames 2 --batch 4`
+
+| predictor | batch | live (img/s) | cached (img/s) | note |
+|-----------|-------|-------------:|---------------:|------|
+| proxy (768/4)  | 4 | 14.7 | 15.6 | runs cleanly on 16 GB |
+| paper (2048/8) | 2 | 0.5  | 0.6  | severe VRAM spill — does not fit |
+
+**Takeaways:** real V-JEPA 2 + real EmbeddingGemma + the proxy predictor is the
+**maximal authentic config runnable on a 16 GB GPU** (~15 img/s @ batch 4); only
+the Llama-3 predictor *weights* remain from-scratch (gated). The paper-size
+predictor together with **both** 300M+ real encoders and their optimizer states
+far exceeds 16 GB and spills to shared memory (0.5 img/s) — that combination
+needs a larger GPU. The cache speedup also drops to ~1.06×: EmbeddingGemma's
+per-step forward+backward enlarges the step, so removing only the V-JEPA 2
+forward saves proportionally less (cache speedup ≈ X-Enc cost ÷ total step cost).
+
 ## Correctness
 
 SDPA is numerically equivalent to eager (max output diff **3.6e-7**); see

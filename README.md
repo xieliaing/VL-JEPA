@@ -111,6 +111,17 @@ Requires `huggingface-cli login` and accepting the licenses for
 GPU recommended). The architecture is identical to the from-scratch path; only
 the module internals and pretrained weights change.
 
+The benchmark can mix in real backbones individually (V-JEPA 2 is ungated;
+EmbeddingGemma needs the license accepted):
+
+```bash
+# real V-JEPA 2 X-Encoder + real EmbeddingGemma Y-Encoder + from-scratch predictor
+PYTHONPATH=. python scripts/benchmark.py --vision vjepa2 --y-encoder embeddinggemma \
+    --predictor proxy --frames 2 --batch 4
+```
+
+See `benchmarks/RESULTS.md` for measured authentic-backbone throughput on 16 GB.
+
 ## Tests
 
 ```bash
