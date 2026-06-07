@@ -26,7 +26,17 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from vljepa.data import VisionLanguageJsonlDataset
-from vljepa.model import HFXEncoder, HFYEncoder, VLJEPA, VLJEPAConfig, bidirectional_infonce
+from vljepa.model import (
+    HFImageXEncoder,
+    HFXEncoder,
+    HFYEncoder,
+    VLJEPA,
+    VLJEPAConfig,
+    bidirectional_infonce,
+)
+
+# Default HF checkpoint per image X-Encoder option.
+IMAGE_X_ENCODERS = {"siglip2": "google/siglip2-base-patch16-256"}
 
 
 class ViTBXEncoder(torch.nn.Module):
@@ -73,6 +83,9 @@ def vision_spec(vision: str, frames: int):
         if frames % 2 != 0:
             raise ValueError("V-JEPA 2 needs an even frame count (tubelet size 2).")
         return 1024, (frames // 2) * 256, frames, 256
+    if vision == "siglip2":
+        # SigLIP 2 base vision tower: hidden 768, 256² / patch 16 -> 256 tokens.
+        return 768, 256, 1, 256
     raise ValueError(vision)
 
 
@@ -192,7 +205,8 @@ def main():
     ap.add_argument("--predictor", choices=["proxy", "paper"], default="proxy")
     ap.add_argument("--attn", choices=["eager", "sdpa"], default="sdpa")
     ap.add_argument("--vision", default="conv,vit_b_16",
-                    help="comma list: conv, vit_b_16, vjepa2 (real V-JEPA 2 ViT-L)")
+                    help="comma list: conv, vit_b_16, vjepa2 (real V-JEPA 2 ViT-L), "
+                         "siglip2 (real SigLIP 2 vision tower, for static images)")
     ap.add_argument("--frames", type=int, default=2,
                     help="frames/sample for vjepa2 (even; 2=image-dup, 8=video setting)")
     ap.add_argument("--y-encoder", choices=["standin", "embeddinggemma", "bge-m3"], default="standin",
@@ -241,6 +255,9 @@ def main():
             model.x_encoder = ViTBXEncoder().to(device)
         elif vision == "vjepa2":
             model.x_encoder = HFXEncoder(cfg).to(device)  # real V-JEPA 2 ViT-L (frozen)
+        elif vision == "siglip2":
+            cfg.x_encoder_name = IMAGE_X_ENCODERS[vision]
+            model.x_encoder = HFImageXEncoder(cfg).to(device)  # SigLIP 2 vision tower (frozen)
         if y_name is not None:
             model.y_encoder = HFYEncoder(cfg).to(device)  # real Y-Encoder (trains @0.05x)
             # Rebuild the projection to match this encoder's hidden size.

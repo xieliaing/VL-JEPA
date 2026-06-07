@@ -320,6 +320,34 @@ class HFXEncoder(nn.Module):
         return out.last_hidden_state  # [B, num_tokens, hidden]
 
 
+class HFImageXEncoder(nn.Module):
+    """Frozen single-image X-Encoder (SigLIP 2 / I-JEPA / DINOv2 vision tower).
+
+    Loads an AutoModel; if it is a dual encoder (e.g. SigLIP 2) the vision tower
+    is used. Encodes the first frame of [B, T, C, H, W] as a still image and
+    returns patch tokens [B, num_patches, hidden]. Appropriate when inputs are
+    static images, avoiding V-JEPA 2's video/tubelet machinery.
+    """
+
+    def __init__(self, cfg: VLJEPAConfig) -> None:
+        super().__init__()
+        try:
+            from transformers import AutoModel
+        except ImportError as e:  # pragma: no cover
+            raise ImportError("pip install transformers to use an HF X-Encoder.") from e
+        m = AutoModel.from_pretrained(cfg.x_encoder_name)
+        self.model = getattr(m, "vision_model", m)  # vision tower for dual encoders
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self.out_dim = self.model.config.hidden_size
+
+    @torch.no_grad()
+    def forward(self, frames: torch.Tensor) -> torch.Tensor:
+        x = frames[:, 0]  # [B, C, H, W] — encode a single still image
+        return self.model(pixel_values=x).last_hidden_state  # [B, num_patches, hidden]
+
+
 class HFYEncoder(nn.Module):
     """Text Y-Encoder via HuggingFace AutoModel -> pooled sentence embedding.
 

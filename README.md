@@ -121,7 +121,9 @@ PYTHONPATH=. python scripts/benchmark.py --vision vjepa2 --y-encoder embeddingge
 ```
 
 `--y-encoder bge-m3` swaps in `BAAI/bge-m3` (XLM-R-large, CLS-pooled) for
-multilingual / CJK targets in place of EmbeddingGemma.
+multilingual / CJK targets in place of EmbeddingGemma. `--vision siglip2` swaps
+the V-JEPA 2 video encoder for the SigLIP 2 vision tower — appropriate for
+static-image inputs (faster, vision-language pretrained); see `benchmarks/RESULTS.md`.
 
 Use `--precision bf16` (pure bf16 weights + bf16 Adam, vs the default AMP's fp32
 master) to roughly halve optimizer memory — this makes the **full paper-size

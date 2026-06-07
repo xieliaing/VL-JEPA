@@ -36,7 +36,9 @@ Run one pytest: `python -m pytest tests/test_model.py::test_sdpa_matches_eager -
   - Llama-3 blocks: `RMSNorm`, `build_rope_cache`/`apply_rope`, `repeat_kv`,
     `LlamaAttention` (GQA; `attn_impl` ∈ {`sdpa` default, `eager`}), `SwiGLU`, `LlamaBlock`
   - Encoders: `StandInXEncoder`/`StandInYEncoder` (no-download) and the HF backend
-    (`HFXEncoder`, `HFYEncoder`, `HFLlamaPredictor`)
+    (`HFXEncoder` = V-JEPA 2 video; `HFImageXEncoder` = SigLIP 2 / I-JEPA / DINOv2
+    still-image vision tower; `HFYEncoder` = EmbeddingGemma/BGE-M3 with `y_pool`
+    mean|cls; `HFLlamaPredictor`)
   - `VLJEPA` (forward returns `{pred, target}`; `param_groups` applies Y-Encoder LR ×0.05;
     `visual_features` exposes the frozen features for caching)
   - `bidirectional_infonce`, `random_batch`

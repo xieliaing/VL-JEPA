@@ -162,6 +162,31 @@ Pooling is the [CLS] token, matching BGE-M3's dense-embedding convention. BGE-M3
 is the choice for multilingual targets; for English-only data EmbeddingGemma is
 lighter at similar throughput.
 
+### SigLIP 2 X-Encoder (static images)
+
+`google/siglip2-base-patch16-256` vision tower (92.9M, hidden 768, 256 tokens at
+256²) in place of V-JEPA 2 ViT-L, for static-image inputs. Stack: SigLIP 2 +
+BGE-M3 + paper predictor + SDPA, pure bf16. Reproduce:
+`python scripts/benchmark.py --predictor paper --vision siglip2 --y-encoder bge-m3 --precision bf16 --batch 16`
+
+| batch | live (img/s) | cached (img/s) | V-JEPA 2 live / cached |
+|-------|-------------:|---------------:|------------------------|
+| 8  | 23.3 | 23.0 | 18.3 / 21.2 |
+| 16 | 33.1 | 32.0 | 23.5 / 28.1 |
+| 32 | 2.8 (spill) | 1.6 (spill) | — |
+
+Takeaways. SigLIP 2's vision tower (92.9M) replaces V-JEPA 2 ViT-L (326M) for
+static images and increases live throughput by approximately 40% at batch 16
+(33.1 vs 23.5 img/s), because it is a smaller image encoder and processes a
+single image rather than V-JEPA 2's duplicated frames. The frozen-feature cache
+provides essentially no speedup with SigLIP 2 (approximately 1.0×): its forward
+is a small fraction of the step, so precomputation and feature storage are
+unnecessary and live training is the simpler path. Batch 16 is the ceiling for
+this stack on 16 GB; batch 32 spills. SigLIP 2 is vision-language pretrained,
+which may align more closely with text targets for product-text retrieval. For
+training, apply SigLIP 2's own image normalization (0.5 mean/std) rather than the
+ImageNet normalization used in these throughput measurements.
+
 ## Correctness
 
 SDPA is numerically equivalent to eager (max output diff **3.6e-7**); see
