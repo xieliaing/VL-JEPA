@@ -187,6 +187,29 @@ which may align more closely with text targets for product-text retrieval. For
 training, apply SigLIP 2's own image normalization (0.5 mean/std) rather than the
 ImageNet normalization used in these throughput measurements.
 
+### DINOv2 X-Encoder (static images)
+
+`facebook/dinov2-base` (86.6M, hidden 768, patch 14, 224² → 256 patches + 1 CLS
+= 257 tokens) as a still-image X-Encoder. Stack: DINOv2 + BGE-M3 + paper
+predictor + SDPA, pure bf16. Reproduce:
+`python scripts/benchmark.py --predictor paper --vision dinov2 --y-encoder bge-m3 --precision bf16 --batch 16`
+
+| batch | live (img/s) | cached (img/s) |
+|-------|-------------:|---------------:|
+| 8  | 22.3 | 22.7 |
+| 16 | 31.7 | 32.1 |
+| 32 | 1.3 (spill) | 1.2 (spill) |
+
+Takeaways. DINOv2-base matches SigLIP 2 in throughput (~32 img/s cached at
+batch 16, ~40% faster live than V-JEPA 2), because both are ViT-B-scale image
+towers of similar size and token count. The frozen-feature cache provides no
+speedup (~1.0×), and batch 32 spills, as with SigLIP 2. The choice between DINOv2
+and SigLIP 2 is therefore about representation quality rather than speed: DINOv2
+is a strong self-supervised encoder for fine-grained and dense visual
+discrimination (product attributes and variants), whereas SigLIP 2 is
+vision-language pretrained and may align more closely with text targets. Both
+should be evaluated on the target product data.
+
 ## Correctness
 
 SDPA is numerically equivalent to eager (max output diff **3.6e-7**); see

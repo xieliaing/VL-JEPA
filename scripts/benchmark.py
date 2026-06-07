@@ -36,7 +36,10 @@ from vljepa.model import (
 )
 
 # Default HF checkpoint per image X-Encoder option.
-IMAGE_X_ENCODERS = {"siglip2": "google/siglip2-base-patch16-256"}
+IMAGE_X_ENCODERS = {
+    "siglip2": "google/siglip2-base-patch16-256",
+    "dinov2": "facebook/dinov2-base",
+}
 
 
 class ViTBXEncoder(torch.nn.Module):
@@ -86,6 +89,9 @@ def vision_spec(vision: str, frames: int):
     if vision == "siglip2":
         # SigLIP 2 base vision tower: hidden 768, 256² / patch 16 -> 256 tokens.
         return 768, 256, 1, 256
+    if vision == "dinov2":
+        # DINOv2-base: hidden 768, patch 14, 224² -> 256 patches + 1 CLS = 257.
+        return 768, 257, 1, 224
     raise ValueError(vision)
 
 
@@ -206,7 +212,7 @@ def main():
     ap.add_argument("--attn", choices=["eager", "sdpa"], default="sdpa")
     ap.add_argument("--vision", default="conv,vit_b_16",
                     help="comma list: conv, vit_b_16, vjepa2 (real V-JEPA 2 ViT-L), "
-                         "siglip2 (real SigLIP 2 vision tower, for static images)")
+                         "siglip2 / dinov2 (real still-image vision towers)")
     ap.add_argument("--frames", type=int, default=2,
                     help="frames/sample for vjepa2 (even; 2=image-dup, 8=video setting)")
     ap.add_argument("--y-encoder", choices=["standin", "embeddinggemma", "bge-m3"], default="standin",
@@ -255,9 +261,9 @@ def main():
             model.x_encoder = ViTBXEncoder().to(device)
         elif vision == "vjepa2":
             model.x_encoder = HFXEncoder(cfg).to(device)  # real V-JEPA 2 ViT-L (frozen)
-        elif vision == "siglip2":
-            cfg.x_encoder_name = IMAGE_X_ENCODERS[vision]
-            model.x_encoder = HFImageXEncoder(cfg).to(device)  # SigLIP 2 vision tower (frozen)
+        elif vision in IMAGE_X_ENCODERS:
+            cfg.x_encoder_name = IMAGE_X_ENCODERS[vision]  # SigLIP 2 / DINOv2 still-image tower
+            model.x_encoder = HFImageXEncoder(cfg).to(device)
         if y_name is not None:
             model.y_encoder = HFYEncoder(cfg).to(device)  # real Y-Encoder (trains @0.05x)
             # Rebuild the projection to match this encoder's hidden size.
