@@ -18,12 +18,13 @@ config switch.
 
 | Component | This implementation | Paper |
 |-----------|---------------------|-------|
-| **X-Encoder** | frozen, stand-in conv ViT (or real V-JEPA 2 via HF) → visual tokens | frozen V-JEPA 2 ViT-L (304M) |
+| **X-Encoder** | frozen; stand-in conv ViT, or real V-JEPA 2 / SigLIP 2 / DINOv2 via HF → visual tokens | frozen V-JEPA 2 ViT-L (304M) |
 | **Predictor** | from-scratch Llama-3 blocks (RoPE/GQA/SwiGLU), **bidirectional**, avg-pool non-[PAD] | last 8 layers of Llama-3.2-1B (490M) |
-| **Y-Encoder** | stand-in text encoder (or real EmbeddingGemma via HF), **LR ×0.05** | EmbeddingGemma-300M |
+| **Y-Encoder** | stand-in text encoder, or real EmbeddingGemma / BGE-M3 via HF, **LR ×0.05** | EmbeddingGemma-300M |
 | **Shared space** | linear projection heads → **1536-d** | 1536-d |
 | **Loss** | **bi-directional InfoNCE** (alignment + in-batch uniformity) | same |
 | **Attention** | **SDPA (fused) by default**, eager available | causal mask disabled (bidirectional) |
+| **Precision** | AMP (fp32 master) or **`--precision bf16`** (bf16 weights + Adam) | — |
 
 The predictor uses **bidirectional** attention (causal mask disabled) so visual
 and query tokens attend jointly — verified explicitly in the correctness suite.
@@ -111,26 +112,45 @@ Requires `huggingface-cli login` and accepting the licenses for
 GPU recommended). The architecture is identical to the from-scratch path; only
 the module internals and pretrained weights change.
 
-The benchmark can mix in real backbones individually (V-JEPA 2 is ungated;
-EmbeddingGemma needs the license accepted):
+### Pluggable encoders
+
+The benchmark can mix real and stand-in backbones independently. Each encoder is
+frozen (X) or trained at 0.05× LR (Y), exactly as in the paper.
+
+**X-Encoder** (`--vision`):
+
+| flag | model | notes |
+|------|-------|-------|
+| `conv` | stand-in conv | offline, no download |
+| `vit_b_16` | torchvision ViT-B/16 (random) | offline stand-in |
+| `vjepa2` | `facebook/vjepa2-vitl-fpc64-256` | paper encoder; video (images duplicated to frames) |
+| `siglip2` | `google/siglip2-base-patch16-256` | static images; vision-language pretrained |
+| `dinov2` | `facebook/dinov2-base` | static images; self-supervised, fine-grained |
+
+**Y-Encoder** (`--y-encoder`):
+
+| flag | model | pooling | notes |
+|------|-------|---------|-------|
+| `standin` | stand-in | mean | offline, no download |
+| `embeddinggemma` | `google/embeddinggemma-300m` | mean | paper encoder |
+| `bge-m3` | `BAAI/bge-m3` (XLM-R-large) | CLS | multilingual / CJK targets |
 
 ```bash
-# real V-JEPA 2 X-Encoder + real EmbeddingGemma Y-Encoder + from-scratch predictor
+# Example: real V-JEPA 2 + real EmbeddingGemma + from-scratch predictor
 PYTHONPATH=. python scripts/benchmark.py --vision vjepa2 --y-encoder embeddinggemma \
     --predictor proxy --frames 2 --batch 4
+
+# Static-image stack for e-commerce (SigLIP 2 or DINOv2 + multilingual BGE-M3)
+PYTHONPATH=. python scripts/benchmark.py --vision siglip2 --y-encoder bge-m3 \
+    --predictor paper --precision bf16 --batch 16
 ```
 
-`--y-encoder bge-m3` swaps in `BAAI/bge-m3` (XLM-R-large, CLS-pooled) for
-multilingual / CJK targets in place of EmbeddingGemma. `--vision siglip2` or
-`--vision dinov2` swaps the V-JEPA 2 video encoder for a still-image vision tower
-— appropriate for static-image inputs (faster; SigLIP 2 is vision-language
-pretrained, DINOv2 is strong self-supervised). See `benchmarks/RESULTS.md`.
-
-Use `--precision bf16` (pure bf16 weights + bf16 Adam, vs the default AMP's fp32
-master) to roughly halve optimizer memory — this makes the **full paper-size
-predictor + both real encoders** fit and scale on a 16 GB GPU (~26 img/s cached
-at batch 16). See `benchmarks/RESULTS.md` for the measured authentic-backbone
-throughput and the AMP-vs-bf16 comparison.
+`--precision bf16` (pure bf16 weights + bf16 Adam, vs the default AMP's fp32
+master) roughly halves optimizer memory — this makes the **full paper-size
+predictor + both real encoders** fit and scale on a 16 GB GPU. See
+[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) for the full per-encoder
+throughput tables (V-JEPA 2 / SigLIP 2 / DINOv2 × EmbeddingGemma / BGE-M3) and
+the AMP-vs-bf16 comparison.
 
 ## Tests
 
