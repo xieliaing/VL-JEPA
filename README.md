@@ -120,6 +120,9 @@ PYTHONPATH=. python scripts/benchmark.py --vision vjepa2 --y-encoder embeddingge
     --predictor proxy --frames 2 --batch 4
 ```
 
+`--y-encoder bge-m3` swaps in `BAAI/bge-m3` (XLM-R-large, CLS-pooled) for
+multilingual / CJK targets in place of EmbeddingGemma.
+
 Use `--precision bf16` (pure bf16 weights + bf16 Adam, vs the default AMP's fp32
 master) to roughly halve optimizer memory — this makes the **full paper-size
 predictor + both real encoders** fit and scale on a 16 GB GPU (~26 img/s cached

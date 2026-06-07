@@ -195,20 +195,26 @@ def main():
                     help="comma list: conv, vit_b_16, vjepa2 (real V-JEPA 2 ViT-L)")
     ap.add_argument("--frames", type=int, default=2,
                     help="frames/sample for vjepa2 (even; 2=image-dup, 8=video setting)")
-    ap.add_argument("--y-encoder", choices=["standin", "embeddinggemma"], default="standin",
-                    help="target encoder: stand-in, or real google/embeddinggemma-300m")
+    ap.add_argument("--y-encoder", choices=["standin", "embeddinggemma", "bge-m3"], default="standin",
+                    help="target encoder: stand-in, real google/embeddinggemma-300m, or BAAI/bge-m3")
     ap.add_argument("--precision", choices=["amp", "bf16"], default="amp",
                     help="amp = fp32 master + autocast bf16 (default); "
                          "bf16 = pure bf16 weights + bf16 Adam (half the optimizer memory)")
     args = ap.parse_args()
 
+    # Real Y-Encoders: (HF model name, pooling). Stand-in uses gpt2 + mean.
+    Y_SPECS = {
+        "embeddinggemma": ("google/embeddinggemma-300m", "mean"),
+        "bge-m3": ("BAAI/bge-m3", "cls"),  # XLM-R-large, multilingual/CJK, CLS-pooled
+    }
     from transformers import AutoTokenizer
     q_tok = AutoTokenizer.from_pretrained("gpt2")  # query -> from-scratch predictor embed
     q_tok.pad_token = q_tok.eos_token
-    if args.y_encoder == "embeddinggemma":
-        t_tok = AutoTokenizer.from_pretrained("google/embeddinggemma-300m")  # target -> real Gemma
+    if args.y_encoder in Y_SPECS:
+        y_name, y_pool = Y_SPECS[args.y_encoder]
+        t_tok = AutoTokenizer.from_pretrained(y_name)  # target -> real encoder's tokenizer
     else:
-        t_tok = q_tok
+        y_name, y_pool, t_tok = None, "mean", q_tok
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Autocast stays on in both modes (it reconciles mixed dtypes from the HF
     # backbones). bf16 saves memory via bf16 *weights + optimizer states*, not
@@ -228,13 +234,17 @@ def main():
         print("=" * 70)
         print(f"VISION = {vision}  (frames={n_frames}, {img_size}px, vis_tokens={n_tok}, vis_dim={vis_dim})")
         cfg = make_config(args.predictor, args.attn, vis_dim, n_tok)
+        if y_name is not None:
+            cfg.y_encoder_name, cfg.y_pool = y_name, y_pool
         model = VLJEPA(cfg).to(device)
         if vision == "vit_b_16":
             model.x_encoder = ViTBXEncoder().to(device)
         elif vision == "vjepa2":
             model.x_encoder = HFXEncoder(cfg).to(device)  # real V-JEPA 2 ViT-L (frozen)
-        if args.y_encoder == "embeddinggemma":
-            model.y_encoder = HFYEncoder(cfg).to(device)  # real EmbeddingGemma (trains @0.05x)
+        if y_name is not None:
+            model.y_encoder = HFYEncoder(cfg).to(device)  # real Y-Encoder (trains @0.05x)
+            # Rebuild the projection to match this encoder's hidden size.
+            model.y_proj = torch.nn.Linear(model.y_encoder.hidden, cfg.shared_dim).to(device)
         if args.precision == "bf16":
             model = model.to(torch.bfloat16)  # pure bf16 weights + bf16 Adam states
 
@@ -244,7 +254,11 @@ def main():
                             prefetch_factor=(4 if args.workers > 0 else None))
         live = run_live(f"{vision} LIVE (X-Enc each step)", model, loader, device, mdtype,
                         use_autocast, args.steps, args.warmup)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()  # release the live phase's optimizer/activations
         feats, toks = precompute(model, ds, collate, device, mdtype, use_autocast, args.batch, args.workers)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         cached = run_cached(f"{vision} CACHED (frozen feats)", model, feats, toks, device, mdtype,
                             use_autocast, args.steps, args.warmup, args.batch)
         results[vision] = (live, cached)

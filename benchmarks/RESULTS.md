@@ -135,6 +135,32 @@ estimate. fp32 master weights with 8-bit Adam provide a more stable alternative
 at a higher memory cost; pure bf16 is appropriate for throughput and feasibility
 measurement.
 
+### BGE-M3 Y-Encoder (multilingual / CJK)
+
+`BAAI/bge-m3` (XLM-RoBERTa-large, ~568M, hidden 1024, [CLS]-pooled) in place of
+EmbeddingGemma, selected for multilingual targets (e.g. Korean/English/Chinese
+e-commerce text). Real V-JEPA 2 + BGE-M3 + paper predictor + SDPA, pure bf16.
+Reproduce: `python scripts/benchmark.py --predictor paper --vision vjepa2 --y-encoder bge-m3 --precision bf16 --frames 2 --batch 8`
+
+| batch | live (img/s) | cached (img/s) | note |
+|-------|-------------:|---------------:|------|
+| 4  | 11.6 | 14.0 | stable |
+| 8  | 18.3 | 21.2 | stable; recommended ceiling |
+| 16 | varies | varies | at the 16 GB boundary; non-deterministic across runs |
+
+Takeaways. BGE-M3 (568M) replaces EmbeddingGemma (303M) with comparable
+throughput, because each step is dominated by the V-JEPA 2 forward and the paper
+predictor and the Y-Encoder is a small fraction of the step (18.3 vs 16.2 img/s
+live at batch 8). The additional ~265M trainable parameters lower the VRAM
+ceiling: batch 8 is stable (18.3 live, 21.2 cached), whereas batch 16 sits at the
+16 GB boundary and throughput varies between runs depending on memory
+fragmentation (observed live 4.8–22.0, cached 2.3–27.6). When the cached path
+fits at batch 16 it reaches ~27.6 img/s while the live path spills, because the
+cache removes the V-JEPA 2 activation footprint that pushes the live step over
+16 GB. Pooling is the [CLS] token, matching BGE-M3's dense-embedding convention.
+BGE-M3 is the choice for multilingual targets; for English-only data
+EmbeddingGemma is lighter at similar throughput.
+
 ## Correctness
 
 SDPA is numerically equivalent to eager (max output diff **3.6e-7**); see

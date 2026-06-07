@@ -57,6 +57,7 @@ class VLJEPAConfig:
     y_hidden: int = 96              # paper: 768 (EmbeddingGemma hidden)
     y_layers: int = 2
     y_lr_multiplier: float = 0.05   # paper §3.1 / Tab. 7(b)
+    y_pool: str = "mean"            # "mean" (EmbeddingGemma) or "cls" (BGE-M3 / XLM-R)
 
     # ---- Shared embedding space
     shared_dim: int = 1536          # paper: 1536
@@ -320,17 +321,24 @@ class HFXEncoder(nn.Module):
 
 
 class HFYEncoder(nn.Module):
-    """EmbeddingGemma-300M via HuggingFace; mean-pooled -> [B, hidden]."""
+    """Text Y-Encoder via HuggingFace AutoModel -> pooled sentence embedding.
+
+    Pooling follows the encoder's convention: mean over non-pad tokens for
+    EmbeddingGemma; the [CLS] token for BGE-M3 / XLM-R-style encoders.
+    """
 
     def __init__(self, cfg: VLJEPAConfig) -> None:
         super().__init__()
         from transformers import AutoModel
         self.model = AutoModel.from_pretrained(cfg.y_encoder_name)
-        self.hidden = self.model.config.hidden_size  # 768
+        self.hidden = self.model.config.hidden_size
+        self.pool = getattr(cfg, "y_pool", "mean")
 
     def forward(self, input_ids, attention_mask):
         out = self.model(input_ids=input_ids, attention_mask=attention_mask)
         h = out.last_hidden_state
+        if self.pool == "cls":
+            return h[:, 0]  # BGE-M3 / XLM-R dense embedding = [CLS] token
         m = attention_mask.unsqueeze(-1).float()
         return (h * m).sum(1) / m.sum(1).clamp_min(1)
 
