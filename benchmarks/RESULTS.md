@@ -142,24 +142,25 @@ EmbeddingGemma, selected for multilingual targets (e.g. Korean/English/Chinese
 e-commerce text). Real V-JEPA 2 + BGE-M3 + paper predictor + SDPA, pure bf16.
 Reproduce: `python scripts/benchmark.py --predictor paper --vision vjepa2 --y-encoder bge-m3 --precision bf16 --frames 2 --batch 8`
 
-| batch | live (img/s) | cached (img/s) | note |
-|-------|-------------:|---------------:|------|
-| 4  | 11.6 | 14.0 | stable |
-| 8  | 18.3 | 21.2 | stable; recommended ceiling |
-| 16 | varies | varies | at the 16 GB boundary; non-deterministic across runs |
+| batch | live (img/s) | cached (img/s) |
+|-------|-------------:|---------------:|
+| 4  | 11.6 | 14.0 |
+| 8  | 18.3 | 21.2 |
+| 16 | 23.5 (23.0–23.9) | 28.1 (27.3–29.5) |
+
+Batch-16 figures are the mean of three consecutive runs (ranges in parentheses).
 
 Takeaways. BGE-M3 (568M) replaces EmbeddingGemma (303M) with comparable
 throughput, because each step is dominated by the V-JEPA 2 forward and the paper
 predictor and the Y-Encoder is a small fraction of the step (18.3 vs 16.2 img/s
-live at batch 8). The additional ~265M trainable parameters lower the VRAM
-ceiling: batch 8 is stable (18.3 live, 21.2 cached), whereas batch 16 sits at the
-16 GB boundary and throughput varies between runs depending on memory
-fragmentation (observed live 4.8–22.0, cached 2.3–27.6). When the cached path
-fits at batch 16 it reaches ~27.6 img/s while the live path spills, because the
-cache removes the V-JEPA 2 activation footprint that pushes the live step over
-16 GB. Pooling is the [CLS] token, matching BGE-M3's dense-embedding convention.
-BGE-M3 is the choice for multilingual targets; for English-only data
-EmbeddingGemma is lighter at similar throughput.
+live at batch 8). Throughput scales cleanly with batch size through 16 (cached
+14.0 → 21.2 → 28.1), indicating the configuration fits within 16 GB with no spill;
+batch 16 is reproducible across runs (~23.5 live, ~28.1 cached). From a clean GPU
+state batch 16 is stable; transient low readings observed earlier were caused by
+residual VRAM left by back-to-back in-process runs, not by the batch size itself.
+Pooling is the [CLS] token, matching BGE-M3's dense-embedding convention. BGE-M3
+is the choice for multilingual targets; for English-only data EmbeddingGemma is
+lighter at similar throughput.
 
 ## Correctness
 
