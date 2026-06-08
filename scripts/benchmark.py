@@ -64,10 +64,11 @@ class ViTBXEncoder(torch.nn.Module):
         return x[:, 1:, :].reshape(b, -1, self.out_dim)  # drop CLS -> [B,196,768]
 
 
-def make_config(predictor: str, attn_impl: str, vis_dim: int, num_visual_tokens: int) -> VLJEPAConfig:
+def make_config(predictor: str, attn_impl: str, vis_dim: int, num_visual_tokens: int,
+                merge_r: int = 0) -> VLJEPAConfig:
     common = dict(vocab_size=50257, vis_dim=vis_dim, num_visual_tokens=num_visual_tokens,
                   max_query_tokens=32, y_hidden=768, y_layers=2, shared_dim=1536,
-                  attn_impl=attn_impl)
+                  attn_impl=attn_impl, visual_merge_r=merge_r)
     if predictor == "proxy":
         return VLJEPAConfig(pred_hidden=768, pred_layers=4, pred_heads=12,
                             pred_kv_heads=4, pred_intermediate=2048, **common)
@@ -220,6 +221,13 @@ def main():
     ap.add_argument("--precision", choices=["amp", "bf16"], default="amp",
                     help="amp = fp32 master + autocast bf16 (default); "
                          "bf16 = pure bf16 weights + bf16 Adam (half the optimizer memory)")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the predictor stack (kernel fusion)")
+    ap.add_argument("--compile-mode", default="default",
+                    help="torch.compile mode: default | reduce-overhead | max-autotune")
+    ap.add_argument("--merge-r", type=int, default=0,
+                    help="ToMe: # visual tokens to merge before the predictor "
+                         "(0 = off). Shrinks sequence length; pooling stays exact.")
     args = ap.parse_args()
 
     # Real Y-Encoders: (HF model name, pooling). Stand-in uses gpt2 + mean.
@@ -253,7 +261,7 @@ def main():
         ds = VisionLanguageJsonlDataset(args.manifest, num_frames=n_frames, image_size=img_size)
         print("=" * 70)
         print(f"VISION = {vision}  (frames={n_frames}, {img_size}px, vis_tokens={n_tok}, vis_dim={vis_dim})")
-        cfg = make_config(args.predictor, args.attn, vis_dim, n_tok)
+        cfg = make_config(args.predictor, args.attn, vis_dim, n_tok, merge_r=args.merge_r)
         if y_name is not None:
             cfg.y_encoder_name, cfg.y_pool = y_name, y_pool
         model = VLJEPA(cfg).to(device)
@@ -270,6 +278,11 @@ def main():
             model.y_proj = torch.nn.Linear(model.y_encoder.hidden, cfg.shared_dim).to(device)
         if args.precision == "bf16":
             model = model.to(torch.bfloat16)  # pure bf16 weights + bf16 Adam states
+        if args.compile:
+            model.compile_predictor(mode=args.compile_mode.replace("-", "_"))
+            print(f"  [torch.compile predictor, mode={args.compile_mode}]")
+        if args.merge_r:
+            print(f"  [ToMe visual-token merge r={args.merge_r}: {n_tok} -> {n_tok - args.merge_r} tokens]")
 
         loader = DataLoader(ds, batch_size=args.batch, shuffle=True, num_workers=args.workers,
                             pin_memory=True, collate_fn=collate, drop_last=True,

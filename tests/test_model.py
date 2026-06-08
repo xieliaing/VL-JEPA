@@ -18,6 +18,7 @@ from vljepa.model import (
     VLJEPAConfig,
     apply_rope,
     bidirectional_infonce,
+    bipartite_soft_match_merge,
     build_rope_cache,
     paper_config,
     random_batch,
@@ -220,6 +221,47 @@ def test_sdpa_matches_eager():
         os_ = sdpa(*batch)
     assert torch.allclose(oe["pred"], os_["pred"], atol=1e-4)
     assert torch.allclose(oe["target"], os_["target"], atol=1e-4)
+
+
+# ---- Visual-token merging (ToMe) -----------------------------------------
+
+def test_tome_reduces_token_count_and_conserves_size():
+    torch.manual_seed(0)
+    x = torch.randn(4, 16, 32)
+    merged, size = bipartite_soft_match_merge(x, r=6)
+    assert merged.shape == (4, 10, 32)            # N - r
+    # Every original token is accounted for in the size vector.
+    assert torch.allclose(size.sum(1).squeeze(-1), torch.full((4,), 16.0))
+
+
+def test_tome_size_weighted_mean_equals_original_mean():
+    """The pooling-faithfulness invariant: merging + size-weighted mean is
+    numerically identical to a plain mean over all the original tokens."""
+    torch.manual_seed(0)
+    x = torch.randn(4, 16, 32)
+    merged, size = bipartite_soft_match_merge(x, r=6)
+    weighted_mean = (merged * size).sum(1) / size.sum(1)
+    assert torch.allclose(weighted_mean, x.mean(1), atol=1e-5)
+
+
+def test_tome_r_zero_is_identity():
+    torch.manual_seed(0)
+    x = torch.randn(2, 8, 16)
+    merged, size = bipartite_soft_match_merge(x, r=0)
+    assert torch.equal(merged, x)
+    assert bool((size == 1).all())
+
+
+def test_model_with_merging_forwards_and_backprops():
+    cfg = VLJEPAConfig(num_visual_tokens=16, visual_merge_r=6)
+    torch.manual_seed(0)
+    model = VLJEPA(cfg)
+    out = model(*random_batch(cfg, b=4, seed=1))
+    assert out["pred"].shape == (4, cfg.shared_dim)
+    bidirectional_infonce(out["pred"], out["target"], cfg.temperature).backward()
+    grad = sum(p.grad.abs().sum().item() for p in model.blocks.parameters()
+               if p.grad is not None)
+    assert grad > 0
 
 
 # ---- HF backend smoke test (gated; opt-in) -------------------------------

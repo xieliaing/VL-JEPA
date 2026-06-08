@@ -24,6 +24,42 @@ SDPA gives **+20% cached** throughput over eager. The frozen-feature cache gain
 scales with X-Encoder cost (1.12× under the cheap conv stand-in, 1.57× under a
 real ViT-B/16).
 
+## Predictor optimizations: torch.compile + visual-token merging (ToMe)
+
+Two predictor-side optimizations, measured on the same proxy / `vit_b_16` / SDPA /
+batch-64 config as above. `--compile` runs `torch.compile` over the from-scratch
+Llama blocks (kernel fusion of RMSNorm + RoPE + SwiGLU + SDPA). `--merge-r N`
+applies ToMe bipartite soft matching to the visual tokens before the predictor,
+reducing the sequence from 196 to 196−N tokens; pooling stays numerically exact
+via per-token size weights (`tests/test_model.py::test_tome_size_weighted_mean_equals_original_mean`).
+
+| config | live (img/s) | cached (img/s) | cached vs baseline |
+|--------|-------------:|---------------:|-------------------:|
+| baseline (no compile, no merge) | 264 | 416 | 1.00× |
+| `--merge-r 98` (196 → 98 tokens) | 355 | 663 | **1.59×** |
+| `--compile` | 336 | 594 | 1.43× |
+| `--compile --merge-r 98` | **395** | **800** | **1.92×** |
+
+Reproduce: `python scripts/benchmark.py --predictor proxy --attn sdpa --vision vit_b_16 --batch 64 --compile --merge-r 98`
+
+Takeaways. Both optimizations target the predictor, so their effect is largest on
+the cached path, where the X-Encoder is precomputed and the predictor dominates
+each step. Visual-token merging at r=98 (halving the visual sequence) increases
+cached throughput by 1.59×; because the from-scratch predictor's cost is
+approximately linear in sequence length for the MLP and quadratic for attention,
+halving the visual tokens reduces both. torch.compile increases cached throughput
+by 1.43× through kernel fusion, with a one-time compilation cost on the first
+step (absorbed by the warmup). The two are complementary — compile fuses the
+per-token operations while merging reduces the token count — and stack to 1.92×
+cached (800 vs 416 img/s) and 1.50× live (395 vs 264 img/s). torch.compile's
+inductor backend runs on Windows under PyTorch 2.11. Token merging is the
+sequence-length analog of sparse attention and is the appropriate lever here:
+the predictor sequence is short (a few hundred tokens) and bidirectional, so
+sparsifying the attention pattern would optimize a small fraction of the compute
+and would violate the bidirectional invariant, whereas reducing the token count
+shrinks the whole stack. Merging discards fine visual detail in proportion to r
+and should be validated on the target retrieval task before use at high ratios.
+
 ## Paper predictor (8-layer / 2048, the real 490M) — vit_b_16 vision
 
 The full-size predictor is **memory-bound** on the 16 GB laptop GPU: above a

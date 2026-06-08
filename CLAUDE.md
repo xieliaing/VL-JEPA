@@ -40,7 +40,11 @@ Run one pytest: `python -m pytest tests/test_model.py::test_sdpa_matches_eager -
     still-image vision tower; `HFYEncoder` = EmbeddingGemma/BGE-M3 with `y_pool`
     mean|cls; `HFLlamaPredictor`)
   - `VLJEPA` (forward returns `{pred, target}`; `param_groups` applies Y-Encoder LR ×0.05;
-    `visual_features` exposes the frozen features for caching)
+    `visual_features` exposes the frozen features for caching; `compile_predictor()`
+    torch.compiles the Llama blocks)
+  - `bipartite_soft_match_merge` — ToMe visual-token merging (gated by
+    `cfg.visual_merge_r`); shrinks the visual sequence before the predictor while
+    keeping pooling exact via per-token size weights
   - `bidirectional_infonce`, `random_batch`
 - `vljepa/data.py` — `VisionLanguageJsonlDataset` (image/video JSONL → frames)
 - `scripts/verify.py`, `scripts/benchmark.py`, `scripts/download_smoke_data.py`

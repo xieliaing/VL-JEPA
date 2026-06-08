@@ -52,6 +52,9 @@ class VLJEPAConfig:
     vis_dim: int = 64               # paper: 1024 (ViT-L hidden)
     num_visual_tokens: int = 8      # stand-in token count per sample
     freeze_x_encoder: bool = True   # paper: frozen
+    visual_merge_r: int = 0         # ToMe: # visual tokens to merge before the
+                                    # predictor (0 = off). Shrinks the sequence
+                                    # itself; pooling stays exact via token sizes.
 
     # ---- Y-Encoder (EmbeddingGemma-300M)
     y_hidden: int = 96              # paper: 768 (EmbeddingGemma hidden)
@@ -418,6 +421,59 @@ class HFLlamaPredictor(nn.Module):
 
 
 # ============================================================================
+# Visual-token merging (ToMe) — the JEPA-correct "sparsity"
+# ============================================================================
+
+def bipartite_soft_match_merge(x: torch.Tensor, r: int, size: torch.Tensor = None):
+    """Token Merging (ToMe, Bolya et al. 2023) on the visual sequence.
+
+    Bipartite soft matching: split tokens into two alternating sets, match each
+    src token to its most-similar dst token by cosine similarity, and average-
+    merge the ``r`` most-confident pairs. Returns the merged tokens and a per-
+    token ``size`` (how many originals each represents) so a later mean-pool can
+    stay numerically identical to pooling all the original tokens.
+
+    This shrinks the sequence length S — cutting the predictor's MLP and
+    attention cost together — instead of sparsifying the S×S attention pattern,
+    which is the wrong lever for short bidirectional sequences.
+
+    x: [B, N, D]; returns (x_merged: [B, N-r, D], size: [B, N-r, 1]).
+    """
+    b, n, d = x.shape
+    if size is None:
+        size = x.new_ones(b, n, 1)
+    r = min(r, n // 2)
+    if r <= 0:
+        return x, size
+
+    # Matching is metric-only (no grad): pick the pairs, then merge with grad.
+    with torch.no_grad():
+        xn = F.normalize(x, dim=-1)
+        a, bset = xn[:, ::2], xn[:, 1::2]                 # alternating split
+        scores = a @ bset.transpose(-1, -2)              # [B, Na, Nb]
+        node_max, node_idx = scores.max(dim=-1)          # best dst for each src
+        edge_idx = node_max.argsort(dim=-1, descending=True)  # most confident first
+        unm_idx = edge_idx[:, r:]                        # kept src tokens
+        src_idx = edge_idx[:, :r]                        # merged-away src tokens
+        dst_idx = node_idx.gather(-1, src_idx)           # their chosen dst
+
+    xa, xb = x[:, ::2], x[:, 1::2]
+    sa, sb = size[:, ::2], size[:, 1::2]
+    exp_d = lambda i: i.unsqueeze(-1).expand(-1, -1, d)
+
+    unm, unm_s = xa.gather(1, exp_d(unm_idx)), sa.gather(1, unm_idx.unsqueeze(-1))
+    src, src_s = xa.gather(1, exp_d(src_idx)), sa.gather(1, src_idx.unsqueeze(-1))
+
+    # Merge src into dst as a size-weighted mean: (xb*sb + Σ src*src_s)/(sb+Σ src_s)
+    xb = xb * sb
+    xb = xb.scatter_add(1, exp_d(dst_idx), src * src_s)
+    sb = sb.scatter_add(1, dst_idx.unsqueeze(-1), src_s)
+    xb = xb / sb
+
+    return torch.cat([unm, xb], dim=1), torch.cat([unm_s, sb], dim=1)
+
+
+# ============================================================================
 # VL-JEPA model
 # ============================================================================
 
@@ -466,6 +522,10 @@ class VLJEPA(nn.Module):
         # vis_feats lets callers pass precomputed frozen features to skip the
         # X-Encoder (the feature-cache fast path).
         vis = self.visual_features(frames) if vis_feats is None else vis_feats
+        # ToMe: merge redundant visual tokens before projecting (shorter S).
+        vis_size = None
+        if self.cfg.visual_merge_r > 0:
+            vis, vis_size = bipartite_soft_match_merge(vis, self.cfg.visual_merge_r)
         vis = self.vis_in_proj(vis)                        # [B, Nv, H]
         b, nv, _ = vis.shape
 
@@ -488,13 +548,16 @@ class VLJEPA(nn.Module):
                 x = blk(x, cos, sin, key_padding_mask=key_mask, is_causal=False)
             h = self.pred_norm(x)
 
-        # Average pool over non-[PAD] tokens (paper §3.1).
+        # Average pool over non-[PAD] tokens (paper §3.1). When visual tokens were
+        # merged, weight each by its ToMe size so the mean equals pooling all the
+        # original tokens; with merging off, sizes are 1 and this is unchanged.
         if self.cfg.pool == "query":
             pm = q_mask.unsqueeze(-1).float()
             pooled = (h[:, nv:, :] * pm).sum(1) / pm.sum(1).clamp_min(1)
         else:  # "all": visual + non-pad query tokens
-            km = key_mask.unsqueeze(-1).float()
-            pooled = (h * km).sum(1) / km.sum(1).clamp_min(1)
+            vw = vis_size.to(h.dtype) if vis_size is not None else h.new_ones(b, nv, 1)
+            w = torch.cat([vw, q_mask.unsqueeze(-1).to(h.dtype)], dim=1)
+            pooled = (h * w).sum(1) / w.sum(1).clamp_min(1)
         return self.pred_proj(pooled)                      # [B, shared_dim]
 
     # ---- Y-Encoder branch: Y -> S_Y ---------------------------------------
@@ -506,6 +569,19 @@ class VLJEPA(nn.Module):
             "pred": self.predict(frames, q_ids, q_mask, vis_feats=vis_feats),
             "target": self.encode_target(t_ids, t_mask),
         }
+
+    # ---- torch.compile the predictor hot path -----------------------------
+    def compile_predictor(self, **kwargs) -> "VLJEPA":
+        """torch.compile the predictor stack for kernel fusion (RMSNorm + RoPE +
+        SwiGLU + SDPA). Leaves the frozen X-Encoder and the dynamic-shape
+        tokenizer paths uncompiled. Opt-in (compilation is slow on first call and
+        the inductor backend needs a C/Triton toolchain — falls back gracefully).
+        """
+        if self.backend == "hf":
+            self.predictor = torch.compile(self.predictor, **kwargs)
+        else:
+            self.blocks = nn.ModuleList([torch.compile(b, **kwargs) for b in self.blocks])
+        return self
 
     # ---- Optimizer parameter groups (Y-Encoder at x0.05) ------------------
     def param_groups(self, lr: float, weight_decay: float = 0.0) -> List[Dict]:

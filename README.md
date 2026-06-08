@@ -100,6 +100,32 @@ frozen X-Encoder once, then skip it) adds a further speedup that scales with
 X-Encoder cost. The real 490M paper predictor is memory-bound on a 16 GB GPU
 (see RESULTS.md) and needs datacenter GPUs to train at speed.
 
+### Predictor optimizations
+
+Two predictor-side flags accelerate the hot path (full table in RESULTS.md):
+
+- **`--compile`** — `torch.compile` over the from-scratch Llama blocks (fuses
+  RMSNorm + RoPE + SwiGLU + SDPA). Runs on Windows under PyTorch 2.11.
+- **`--merge-r N`** — **ToMe** visual-token merging (Bolya et al. 2023): bipartite
+  soft matching merges the `N` most-redundant visual tokens *before* the
+  predictor, shrinking the sequence length itself. Pooling stays numerically
+  exact via per-token size weights. This is the sequence-length analog of sparse
+  attention, and the correct lever for the predictor's short, **bidirectional**
+  sequence — sparsifying the attention *pattern* would optimize ~3% of the
+  compute and break the bidirectional invariant.
+
+| proxy / vit_b_16 / SDPA / batch 64 | live | cached | cached gain |
+|------------------------------------|-----:|-------:|------------:|
+| baseline                           | 264  | 416    | 1.00× |
+| `--merge-r 98` (196→98 tokens)     | 355  | 663    | 1.59× |
+| `--compile`                        | 336  | 594    | 1.43× |
+| `--compile --merge-r 98`           | **395** | **800** | **1.92×** |
+
+```bash
+PYTHONPATH=. python scripts/benchmark.py --predictor proxy --attn sdpa \
+    --vision vit_b_16 --batch 64 --compile --merge-r 98
+```
+
 ## Real HuggingFace backbones
 
 ```python
